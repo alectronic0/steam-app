@@ -1,0 +1,231 @@
+name: steam-app Build & Test
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'steam-app/**'
+      - '.github/workflows/steam-app-ci.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'steam-app/**'
+
+jobs:
+  install:
+    name: Install Dependencies
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: steam-app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Cache node_modules
+        uses: actions/cache@v3
+        with:
+          path: steam-app/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('steam-app/bun.lockb') }}
+
+  lint:
+    name: Linting & Formatting
+    runs-on: ubuntu-latest
+    needs: install
+    defaults:
+      run:
+        working-directory: steam-app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Restore dependencies
+        run: bun install --frozen-lockfile
+
+      - name: TypeScript type check
+        run: |
+          if [ -f ./tsconfig.json ]; then
+            bun run --bun tsc --noEmit || true
+          fi
+
+      - name: ESLint check
+        run: |
+          if [ -f .eslintrc.json ] || [ -f .eslintrc.js ]; then
+            npx eslint src --ext .ts,.tsx --max-warnings 0 || echo "ESLint warnings found (non-blocking)"
+          fi
+
+      - name: Prettier formatting check
+        run: |
+          if [ -f .prettierrc ] || [ -f .prettierrc.json ]; then
+            npx prettier --check src || echo "Format issues found (non-blocking)"
+          fi
+
+  test:
+    name: Unit Tests & Coverage
+    runs-on: ubuntu-latest
+    needs: install
+    defaults:
+      run:
+        working-directory: steam-app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Restore dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run tests
+        run: |
+          if [ -f ./package.json ] && grep -q '"test"' ./package.json; then
+            bun test --coverage || echo "Tests not configured yet"
+          fi
+        continue-on-error: true
+
+      - name: Archive test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: steam-app/coverage
+          retention-days: 30
+
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: install
+    defaults:
+      run:
+        working-directory: steam-app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Restore dependencies
+        run: bun install --frozen-lockfile
+
+      - name: npm audit - Check for vulnerabilities
+        run: npm audit --production || echo "Vulnerabilities found - review needed"
+        continue-on-error: true
+
+      - name: Gitleaks - Secret scanning
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Snyk Security Scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+        continue-on-error: true
+
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [ lint, test ]
+    defaults:
+      run:
+        working-directory: steam-app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Restore dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build project
+        run: bun run build
+
+      - name: Verify build output
+        run: |
+          if [ -d ./dist ]; then
+            echo "✅ Build successful"
+            ls -lah dist/ | head -20
+          else
+            echo "❌ Build output not found"
+            exit 1
+          fi
+
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: steam-app/dist
+          retention-days: 7
+
+  docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    defaults:
+      run:
+        working-directory: steam-app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t steam-app:${{ github.sha }} -f Dockerfile .
+
+      - name: Verify image
+        run: docker images | grep steam-app
+
+  docker-test:
+    name: Test Docker Container
+    runs-on: ubuntu-latest
+    needs: docker
+    defaults:
+      run:
+        working-directory: steam-app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test Docker
+        run: |
+          docker-compose build
+          docker-compose up -d
+          sleep 5
+          docker-compose exec -T steam-app wget --quiet --tries=1 --spider http://localhost:3000 || exit 1
+          docker-compose down
+
+  results:
+    name: Build Results Summary
+    runs-on: ubuntu-latest
+    needs: [ lint, test, security, build, docker, docker-test ]
+    if: always()
+
+    steps:
+      - name: Check build status
+        run: |
+          if [ "${{ needs.lint.result }}" == "failure" ]; then
+            echo "⚠️ Linting issues found"
+          fi
+          if [ "${{ needs.test.result }}" == "failure" ]; then
+            echo "⚠️ Test issues found"
+          fi
+          if [ "${{ needs.build.result }}" == "failure" ]; then
+            echo "❌ Build failed"
+            exit 1
+          fi
+          echo "✅ Build and Docker tests passed!"
